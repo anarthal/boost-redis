@@ -11,6 +11,9 @@
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/consign.hpp>
 #include <boost/asio/detached.hpp>
+#include <boost/asio/error.hpp>
+#include <boost/asio/experimental/cancellation_condition.hpp>
+#include <boost/asio/experimental/parallel_group.hpp>
 #include <boost/asio/signal_set.hpp>
 
 #include <iostream>
@@ -43,15 +46,15 @@ using asio::signal_set;
  */
 
 // Receives server pushes.
-auto receiver(std::shared_ptr<connection> conn) -> asio::awaitable<void>
+auto receiver(connection& conn) -> asio::awaitable<void>
 {
    generic_flat_response resp;
-   conn->set_receive_response(resp);
+   conn.set_receive_response(resp);
 
    // Subscribe to the channel 'mychannel'. You can add any number of channels here.
    request req;
    req.subscribe({"mychannel"});
-   co_await conn->async_exec(req);
+   co_await conn.async_exec(req);
 
    // You're now subscribed to 'mychannel'. Pushes sent over this channel will be stored
    // in resp. If the connection encounters a network error and reconnects to the server,
@@ -60,13 +63,14 @@ auto receiver(std::shared_ptr<connection> conn) -> asio::awaitable<void>
    // to enable this behavior.
 
    // Loop to read Redis push messages.
-   while (conn->will_reconnect()) {
+   while (true) {
       // Wait for pushes
-      auto [ec] = co_await conn->async_receive2(asio::as_tuple);
+      auto [ec] = co_await conn.async_receive2(asio::as_tuple);
 
       // Check for errors and cancellations
       if (ec) {
-         std::cerr << "Error during receive: " << ec << std::endl;
+         if (ec != asio::error::operation_aborted)
+            std::cerr << "Error during receive: " << ec << std::endl;
          break;
       }
 
@@ -84,14 +88,14 @@ auto receiver(std::shared_ptr<connection> conn) -> asio::awaitable<void>
 auto co_main(config cfg) -> asio::awaitable<void>
 {
    auto ex = co_await asio::this_coro::executor;
-   auto conn = std::make_shared<connection>(ex);
-   asio::co_spawn(ex, receiver(conn), asio::detached);
-   conn->async_run(cfg, asio::consign(asio::detached, conn));
-
+   connection conn{ex};
    signal_set sig_set(ex, SIGINT, SIGTERM);
-   co_await sig_set.async_wait();
 
-   conn->cancel();
+   co_await asio::experimental::make_parallel_group(
+      conn.async_run(cfg),
+      asio::co_spawn(ex, receiver(conn)),
+      sig_set.async_wait())
+      .async_wait(asio::experimental::wait_for_one(), asio::deferred);
 }
 
 #endif  // defined(BOOST_ASIO_HAS_CO_AWAIT)
